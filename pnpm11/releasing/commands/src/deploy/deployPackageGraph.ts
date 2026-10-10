@@ -213,6 +213,7 @@ function findAncestorPeerReferences (peerName: string, ctx: BindPeersContext): M
     for (const dependent of graph.dependents.get(depPath) ?? []) {
       const reference = providedPeerReference(graph, dependent, peerName)
       if (reference != null) {
+        if (dp.packageRootLinkTarget(reference) != null) return new Map<string, string>()
         references.set(dp.refToRelative(reference, peerName) ?? reference, reference)
       } else if (dependent !== IMPORTER && !visited.has(dependent)) {
         visited.add(dependent)
