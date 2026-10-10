@@ -769,10 +769,9 @@ fn shared_lockfile_deploy_refuses_a_peer_its_parents_provide_as_different_packag
         .expect("run pacquet deploy");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("ERR_PNPM_DEPLOY_AMBIGUOUS_PEER"),
-        "stderr should mention ERR_PNPM_DEPLOY_AMBIGUOUS_PEER:\n{stderr}",
-    );
+    for expected in ["ERR_PNPM_DEPLOY_AMBIGUOUS_PEER", "(1.0.0, @pnpm.e2e/peer-b@1.0.0)"] {
+        assert!(stderr.contains(expected), "stderr should mention {expected}:\n{stderr}");
+    }
 
     drop((root, mock_instance));
 }

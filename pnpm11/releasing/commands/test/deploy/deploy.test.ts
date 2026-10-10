@@ -897,7 +897,10 @@ test('native deploy refuses a linked workspace package peer its parents provide 
   await install.handler(opts)
   await expect(
     deploy.handler({ ...opts, production: true, recursive: true, selectedProjectsGraph }, ['deploy'])
-  ).rejects.toMatchObject({ code: 'ERR_PNPM_DEPLOY_AMBIGUOUS_PEER' })
+  ).rejects.toMatchObject({
+    code: 'ERR_PNPM_DEPLOY_AMBIGUOUS_PEER',
+    message: expect.stringContaining('(1.0.0, @pnpm.e2e/peer-b@1.0.0)'),
+  })
 })
 
 // project-3 does not depend on project-2's peer, so the search continues to

@@ -170,7 +170,7 @@ function pickPeerReference (peerName: string, ctx: BindPeersContext): string | u
   const ancestorReferences = findAncestorPeerReferences(peerName, ctx)
   if (ancestorReferences.size === 1) return Array.from(ancestorReferences.values())[0]
   if (ancestorReferences.size > 1) {
-    throw ambiguousPeerError(peerName, Array.from(ancestorReferences.values(), reference => referenceVersion(reference, peerName)), ctx)
+    throw ambiguousPeerError(peerName, Array.from(ancestorReferences.values(), reference => describeReference(reference, peerName)), ctx)
   }
   const candidates = ctx.graph.references.get(peerName)
   // A peer the deployed graph does not provide at all stays unresolved,
@@ -232,12 +232,15 @@ function providedPeerReference (graph: DeployedGraph, dependent: Dependent, peer
   return providing?.[peerName]
 }
 
-/** The version part of the dependency path `reference` resolves to. */
-function referenceVersion (reference: string, alias: string): string {
+/**
+ * The version `reference` resolves to, or its whole dependency path when it
+ * names a package other than `alias`.
+ */
+function describeReference (reference: string, alias: string): string {
   const depPath = dp.refToRelative(reference, alias)
   if (depPath == null) return reference
   const { name } = dp.parse(depPath)
-  return name == null ? depPath : depPath.slice(name.length + 1)
+  return name === alias ? depPath.slice(alias.length + 1) : depPath
 }
 
 function collectDependents (importer: ProjectSnapshot, packages: PackageSnapshots): Map<DepPath, Dependent[]> {

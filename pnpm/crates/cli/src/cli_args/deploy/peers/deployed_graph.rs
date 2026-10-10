@@ -1,6 +1,6 @@
 use super::{
-    HashMap, HashSet, ImporterDepVersion, Lockfile, PkgName, PkgNameVerPeer, ProjectSnapshot,
-    SnapshotDepRef, SnapshotEntry, VecDeque,
+    HashMap, HashSet, ImporterDepVersion, PkgName, PkgNameVerPeer, ProjectSnapshot, SnapshotDepRef,
+    SnapshotEntry, VecDeque,
 };
 
 /// The pruned deployed lockfile, indexed for binding the peers of linked
@@ -24,11 +24,11 @@ pub(super) enum Dependent<'a> {
 /// rather than by the reference that spelled it, so an npm-aliased edge
 /// and a plain one that name the same package count once.
 pub(super) fn resolution_candidates(
-    lockfile: &Lockfile,
+    importer: Option<&ProjectSnapshot>,
     snapshots: &HashMap<PkgNameVerPeer, SnapshotEntry>,
 ) -> HashMap<PkgName, HashSet<PkgNameVerPeer>> {
-    let importer_keys = importer_dependencies(lockfile.importers.get(Lockfile::ROOT_IMPORTER_KEY))
-        .filter_map(|(alias, version)| version.resolved_key(alias));
+    let importer_keys =
+        importer_dependencies(importer).filter_map(|(alias, version)| version.resolved_key(alias));
     let snapshot_keys = snapshots
         .values()
         .flat_map(snapshot_dependencies)
@@ -45,10 +45,10 @@ pub(super) fn resolution_candidates(
 
 /// The nodes that depend on each snapshot of the deployed graph.
 pub(super) fn dependents_by_snapshot<'a>(
-    lockfile: &'a Lockfile,
+    importer: Option<&'a ProjectSnapshot>,
     snapshots: &'a HashMap<PkgNameVerPeer, SnapshotEntry>,
 ) -> HashMap<PkgNameVerPeer, Vec<Dependent<'a>>> {
-    let importer_edges = importer_dependencies(lockfile.importers.get(Lockfile::ROOT_IMPORTER_KEY))
+    let importer_edges = importer_dependencies(importer)
         .filter_map(|(alias, version)| version.resolved_key(alias))
         .map(|child| (child, Dependent::Importer));
     let snapshot_edges = snapshots
@@ -100,15 +100,19 @@ pub(super) fn snapshot_dependencies(
 /// injecting the package would resolve its peer from its parents. An
 /// ancestor that does not depend on `peer` passes the search on to its own
 /// dependents.
+///
+/// `None` when an ancestor provides the peer through a link into its own
+/// package, which reads differently in the linked package's snapshot.
 pub(super) fn ancestor_peer_providers(
     graph: &DeployedGraph<'_>,
     package_key: &PkgNameVerPeer,
     peer: &PkgName,
-) -> Vec<SnapshotDepRef> {
+) -> Option<Vec<SnapshotDepRef>> {
     let mut search = ProviderSearch {
         providers: Vec::new(),
         visited: HashSet::new(),
         queue: VecDeque::from([package_key]),
+        links_into_a_provider: false,
     };
     while let Some(key) = search.queue.pop_front() {
         for dependent in graph.dependents
@@ -119,7 +123,7 @@ pub(super) fn ancestor_peer_providers(
             search.visit(graph, *dependent, peer);
         }
     }
-    search.providers
+    (!search.links_into_a_provider).then_some(search.providers)
 }
 
 /// The state of [`ancestor_peer_providers`]'s breadth-first walk.
@@ -127,6 +131,7 @@ struct ProviderSearch<'a> {
     providers: Vec<SnapshotDepRef>,
     visited: HashSet<&'a PkgNameVerPeer>,
     queue: VecDeque<&'a PkgNameVerPeer>,
+    links_into_a_provider: bool,
 }
 
 impl<'a> ProviderSearch<'a> {
@@ -134,6 +139,11 @@ impl<'a> ProviderSearch<'a> {
     /// dependents.
     fn visit(&mut self, graph: &DeployedGraph<'a>, dependent: Dependent<'a>, peer: &PkgName) {
         match (provided_peer(graph, dependent, peer), dependent) {
+            (Some(SnapshotDepRef::Link(target)), _)
+                if pnpm_lockfile::package_root_link_target(&target).is_some() =>
+            {
+                self.links_into_a_provider = true;
+            }
             (Some(reference), _)
                 if !self.providers.iter().any(|known| same_target(known, &reference, peer)) =>
             {
@@ -191,3 +201,6 @@ fn same_target(left: &SnapshotDepRef, right: &SnapshotDepRef, peer: &PkgName) ->
         _ => left == right,
     }
 }
+
+#[cfg(test)]
+mod tests;

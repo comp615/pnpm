@@ -85,12 +85,13 @@ pub(super) fn bind_singleton_peers(
         return Ok(());
     }
     let Some(snapshots) = lockfile.snapshots.as_ref() else { return Ok(()) };
+    let importer = lockfile.importers.get(Lockfile::ROOT_IMPORTER_KEY);
 
     let graph = DeployedGraph {
-        importer: lockfile.importers.get(Lockfile::ROOT_IMPORTER_KEY),
+        importer,
         snapshots,
-        candidates: resolution_candidates(lockfile, snapshots),
-        dependents: dependents_by_snapshot(lockfile, snapshots),
+        candidates: resolution_candidates(importer, snapshots),
+        dependents: dependents_by_snapshot(importer, snapshots),
     };
     let bindings = collect_peer_bindings(&graph, linked_workspace_projects)?;
 
@@ -188,14 +189,18 @@ fn ancestor_peer_binding(
     graph: &DeployedGraph<'_>,
     site: &LinkedPeer<'_>,
 ) -> miette::Result<Option<SnapshotDepRef>> {
-    match ancestor_peer_providers(graph, site.package_key, site.peer).as_slice() {
+    let Some(providers) = ancestor_peer_providers(graph, site.package_key, site.peer) else {
+        return Ok(None);
+    };
+    match providers.as_slice() {
         [] => Ok(None),
         [reference] => Ok(Some(reference.clone())),
         providers => Err(site.ambiguous(
             providers
                 .iter()
                 .map(|reference| match reference.resolve(site.peer) {
-                    Some(key) => key.suffix.to_string(),
+                    Some(key) if &key.name == site.peer => key.suffix.to_string(),
+                    Some(key) => key.to_string(),
                     None => reference.to_string(),
                 }),
         )),
