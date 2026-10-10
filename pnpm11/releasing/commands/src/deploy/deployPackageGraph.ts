@@ -168,8 +168,12 @@ function pickPeerReference (peerName: string, ctx: BindPeersContext): string | u
   const dedupedReference = findDedupedPeerReference(peerName, ctx)
   if (dedupedReference != null) return dedupedReference
   const ancestorReferences = findAncestorPeerReferences(peerName, ctx)
-  if (ancestorReferences.size === 1) return Array.from(ancestorReferences.values())[0]
-  if (ancestorReferences.size > 1) {
+  if (ancestorReferences.size === 1) {
+    const [reference] = ancestorReferences.values()
+    // A link into the providing package would point into the linked package
+    // once copied into its snapshot.
+    if (dp.packageRootLinkTarget(reference) == null) return reference
+  } else if (ancestorReferences.size > 1) {
     throw ambiguousPeerError(peerName, Array.from(ancestorReferences.values(), reference => describeReference(reference, peerName)), ctx)
   }
   const candidates = ctx.graph.references.get(peerName)
@@ -202,26 +206,49 @@ function findDedupedPeerReference (peerName: string, ctx: BindPeersContext): str
  * not depend on `peerName` passes the search on to its own dependents.
  *
  * Keyed by the dependency path the reference resolves to, so two spellings of
- * one package count once and two packages at one version do not.
+ * one package count once and two packages at one version do not. A link into
+ * the providing package names a different package for each provider, so it is
+ * keyed by its provider as well.
  */
 function findAncestorPeerReferences (peerName: string, ctx: BindPeersContext): Map<string, string> {
-  const { graph } = ctx
-  const references = new Map<string, string>()
-  const visited = new Set<DepPath>([ctx.depPath])
-  const queue: DepPath[] = [ctx.depPath]
-  for (let depPath = queue.shift(); depPath != null; depPath = queue.shift()) {
-    for (const dependent of graph.dependents.get(depPath) ?? []) {
-      const reference = providedPeerReference(graph, dependent, peerName)
-      if (reference != null) {
-        if (dp.packageRootLinkTarget(reference) != null) return new Map<string, string>()
-        references.set(dp.refToRelative(reference, peerName) ?? reference, reference)
-      } else if (dependent !== IMPORTER && !visited.has(dependent)) {
-        visited.add(dependent)
-        queue.push(dependent)
-      }
+  const search: ProviderSearch = {
+    graph: ctx.graph,
+    peerName,
+    references: new Map(),
+    visited: new Set([ctx.depPath]),
+    queue: [ctx.depPath],
+  }
+  for (let index = 0; index < search.queue.length; index++) {
+    for (const dependent of search.graph.dependents.get(search.queue[index]) ?? []) {
+      visitDependent(search, dependent)
     }
   }
-  return references
+  return search.references
+}
+
+/** The state of {@link findAncestorPeerReferences}'s breadth-first walk. */
+interface ProviderSearch {
+  graph: DeployedGraph
+  peerName: string
+  references: Map<string, string>
+  visited: Set<DepPath>
+  queue: DepPath[]
+}
+
+/** Record what `dependent` provides, or queue it to search its own dependents. */
+function visitDependent (search: ProviderSearch, dependent: Dependent): void {
+  const reference = providedPeerReference(search.graph, dependent, search.peerName)
+  if (reference != null) {
+    search.references.set(providerKey(reference, dependent, search.peerName), reference)
+  } else if (dependent !== IMPORTER && !search.visited.has(dependent)) {
+    search.visited.add(dependent)
+    search.queue.push(dependent)
+  }
+}
+
+function providerKey (reference: string, dependent: Dependent, peerName: string): string {
+  if (dp.packageRootLinkTarget(reference) != null) return `${String(dependent)} ${reference}`
+  return dp.refToRelative(reference, peerName) ?? reference
 }
 
 /** The reference `dependent` resolves `peerName` to, if it depends on it. */

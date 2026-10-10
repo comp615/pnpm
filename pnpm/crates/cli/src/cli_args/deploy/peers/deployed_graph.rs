@@ -101,18 +101,18 @@ pub(super) fn snapshot_dependencies(
 /// ancestor that does not depend on `peer` passes the search on to its own
 /// dependents.
 ///
-/// `None` when an ancestor provides the peer through a link into its own
-/// package, which reads differently in the linked package's snapshot.
+/// A link into the providing package, see [`is_package_root_link`], names a
+/// different package for each provider, so it counts once per provider.
 pub(super) fn ancestor_peer_providers(
     graph: &DeployedGraph<'_>,
     package_key: &PkgNameVerPeer,
     peer: &PkgName,
-) -> Option<Vec<SnapshotDepRef>> {
+) -> Vec<SnapshotDepRef> {
     let mut search = ProviderSearch {
         providers: Vec::new(),
         visited: HashSet::new(),
         queue: VecDeque::from([package_key]),
-        links_into_a_provider: false,
+        package_root_link_providers: HashSet::new(),
     };
     while let Some(key) = search.queue.pop_front() {
         for dependent in graph.dependents
@@ -123,7 +123,7 @@ pub(super) fn ancestor_peer_providers(
             search.visit(graph, *dependent, peer);
         }
     }
-    (!search.links_into_a_provider).then_some(search.providers)
+    search.providers
 }
 
 /// The state of [`ancestor_peer_providers`]'s breadth-first walk.
@@ -131,7 +131,7 @@ struct ProviderSearch<'a> {
     providers: Vec<SnapshotDepRef>,
     visited: HashSet<&'a PkgNameVerPeer>,
     queue: VecDeque<&'a PkgNameVerPeer>,
-    links_into_a_provider: bool,
+    package_root_link_providers: HashSet<&'a PkgNameVerPeer>,
 }
 
 impl<'a> ProviderSearch<'a> {
@@ -139,10 +139,12 @@ impl<'a> ProviderSearch<'a> {
     /// dependents.
     fn visit(&mut self, graph: &DeployedGraph<'a>, dependent: Dependent<'a>, peer: &PkgName) {
         match (provided_peer(graph, dependent, peer), dependent) {
-            (Some(SnapshotDepRef::Link(target)), _)
-                if pnpm_lockfile::package_root_link_target(&target).is_some() =>
+            (Some(reference), Dependent::Snapshot(provider))
+                if is_package_root_link(&reference) =>
             {
-                self.links_into_a_provider = true;
+                if self.package_root_link_providers.insert(provider) {
+                    self.providers.push(reference);
+                }
             }
             (Some(reference), _)
                 if !self.providers.iter().any(|known| same_target(known, &reference, peer)) =>
@@ -191,6 +193,12 @@ fn importer_version_to_snapshot_ref(
     } else {
         SnapshotDepRef::Alias(key)
     })
+}
+
+/// Whether `reference` links into the package that declares it, which reads
+/// differently once copied into another package's snapshot.
+pub(super) fn is_package_root_link(reference: &SnapshotDepRef) -> bool {
+    matches!(reference, SnapshotDepRef::Link(target) if pnpm_lockfile::package_root_link_target(target).is_some())
 }
 
 /// Whether two references to `peer` name the same package, however each is

@@ -26,7 +26,7 @@ fn snapshot(dependencies: &[(&str, &str)]) -> SnapshotEntry {
 
 /// The providers of `peer` for `lib@1.0.0`, which `mid@1.0.0` and
 /// `mid-2@1.0.0` depend on.
-fn providers(mid: &[(&str, &str)], mid_2: &[(&str, &str)]) -> Option<Vec<SnapshotDepRef>> {
+fn providers(mid: &[(&str, &str)], mid_2: &[(&str, &str)]) -> Vec<SnapshotDepRef> {
     let snapshots = HashMap::from([
         (key("lib@1.0.0"), SnapshotEntry::default()),
         (key("mid@1.0.0"), snapshot(mid)),
@@ -48,7 +48,7 @@ fn two_spellings_of_one_package_count_once() {
         &[("lib", "1.0.0"), ("peer", "1.0.0")],
         &[("lib", "1.0.0"), ("peer", "peer@1.0.0")],
     );
-    assert_eq!(found.map(|found| found.len()), Some(1));
+    assert_eq!(found.len(), 1);
 }
 
 #[test]
@@ -57,13 +57,16 @@ fn two_packages_at_one_version_are_distinct() {
         &[("lib", "1.0.0"), ("peer", "1.0.0")],
         &[("lib", "1.0.0"), ("peer", "other@1.0.0")],
     );
-    assert_eq!(found.map(|found| found.len()), Some(2));
+    assert_eq!(found.len(), 2);
 }
 
-/// A `<root>/` link points into the providing package, so copying it into
-/// `lib`'s snapshot would point into `lib` instead.
+/// A `<root>/` link points into the package that declares it, so it names a
+/// different package than any other provider.
 #[test]
-fn a_link_into_the_providing_package_is_not_copied() {
-    let found = providers(&[("lib", "1.0.0"), ("peer", "link:<root>/vendor/peer")], &[]);
-    assert_eq!(found, None);
+fn a_link_into_the_providing_package_is_its_own_provider() {
+    let found = providers(
+        &[("lib", "1.0.0"), ("peer", "link:<root>/vendor/peer")],
+        &[("lib", "1.0.0"), ("peer", "1.0.0")],
+    );
+    assert_eq!(found.len(), 2);
 }

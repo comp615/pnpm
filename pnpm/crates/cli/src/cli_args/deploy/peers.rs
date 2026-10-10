@@ -8,8 +8,8 @@ use super::{
 mod deployed_graph;
 
 use deployed_graph::{
-    DeployedGraph, ancestor_peer_providers, dependents_by_snapshot, resolution_candidates,
-    snapshot_dependencies,
+    DeployedGraph, ancestor_peer_providers, dependents_by_snapshot, is_package_root_link,
+    resolution_candidates, snapshot_dependencies,
 };
 
 /// A workspace package the deployed graph links rather than injects.
@@ -189,11 +189,9 @@ fn ancestor_peer_binding(
     graph: &DeployedGraph<'_>,
     site: &LinkedPeer<'_>,
 ) -> miette::Result<Option<SnapshotDepRef>> {
-    let Some(providers) = ancestor_peer_providers(graph, site.package_key, site.peer) else {
-        return Ok(None);
-    };
-    match providers.as_slice() {
+    match ancestor_peer_providers(graph, site.package_key, site.peer).as_slice() {
         [] => Ok(None),
+        [reference] if is_package_root_link(reference) => Ok(None),
         [reference] => Ok(Some(reference.clone())),
         providers => Err(site.ambiguous(
             providers
