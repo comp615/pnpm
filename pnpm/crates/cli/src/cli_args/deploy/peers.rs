@@ -1,28 +1,26 @@
 use super::{
     Config, ConvertCtx, DependencyGroup, DeployError, HashMap, HashSet, ImporterDepVersion,
-    Lockfile, PackageKey, PackageManifest, PeerSatisfactionEdges, PkgName, PkgNameVerPeer,
-    ProjectInfo, ProjectPathKey, ProjectSnapshot, ResolveBases, SnapshotDepRef, SnapshotEntry,
-    Value, VecDeque, convert_importer_version_to_snapshot_ref, convert_package_key,
-    resolution::split_local_payload,
+    Lockfile, PackageKey, PeerSatisfactionEdges, PkgName, PkgNameVerPeer, ProjectInfo,
+    ProjectSnapshot, ResolveBases, SnapshotDepRef, SnapshotEntry, Value, VecDeque,
+    convert_importer_version_to_snapshot_ref, convert_package_key,
+};
+
+mod deployed_graph;
+
+use deployed_graph::{
+    DeployedGraph, ancestor_peer_providers, dependents_by_snapshot, resolution_candidates,
+    snapshot_dependencies,
 };
 
 /// A workspace package the deployed graph links rather than injects.
 pub(super) struct LinkedWorkspaceProject {
     project: ProjectInfo,
-    /// The project's dev dependencies that are also its peers and that the
-    /// deploy keeps as the peer's binding.
-    ///
-    /// In an injected workspace that is every such dev dependency. There a
-    /// workspace package is linked rather than injected only when its injected
-    /// resolution matched its own importer, dev dependencies included, so a
-    /// peer it also lists as a dev dependency was bound to exactly that.
-    ///
-    /// Without injection, a linked package's dev dependencies say nothing
-    /// about what injecting it would bind, so they are not recorded, with one
-    /// narrow exception to approximating that choice: a peer declared with a
-    /// `workspace:` range whose dev dependency links a workspace project. The
-    /// range admits only that project, and the workspace links it there.
-    deduped_peer_resolutions: HashMap<PkgName, SnapshotDepRef>,
+    /// The project's dev dependencies that are also its peers, recorded only
+    /// in an injected workspace. There a workspace package is linked rather
+    /// than injected only when its injected resolution matched its own
+    /// importer, dev dependencies included, so a peer it also lists as a dev
+    /// dependency was bound to exactly that.
+    deduped_peer_resolutions: Option<HashMap<PkgName, SnapshotDepRef>>,
 }
 
 impl LinkedWorkspaceProject {
@@ -35,13 +33,9 @@ impl LinkedWorkspaceProject {
     ) -> Self {
         let injected_workspace =
             lockfile.settings.as_ref().is_some_and(|settings| settings.inject_workspace_packages);
-        let links_workspace_project = |version: &ImporterDepVersion| match version {
-            ImporterDepVersion::Link(target) => {
-                let (path, _) = split_local_payload(target);
-                ctx.projects_by_path.contains_key(&ProjectPathKey::new(&bases.link_base.join(path)))
-            }
-            _ => false,
-        };
+        if !injected_workspace {
+            return LinkedWorkspaceProject { project, deduped_peer_resolutions: None };
+        }
         // A reference the conversion rejects, such as a link outside the
         // workspace, cannot name a deployed snapshot, since every snapshot key
         // passed the same conversion. It is skipped rather than failing a
@@ -50,18 +44,13 @@ impl LinkedWorkspaceProject {
             .iter()
             .flatten()
             .filter(|(name, _)| project.peer_dependencies.contains(name))
-            .filter(|(name, spec)| {
-                injected_workspace
-                    || (project.workspace_protocol_peers.contains(name)
-                        && links_workspace_project(&spec.version))
-            })
             .filter_map(|(name, spec)| {
                 convert_importer_version_to_snapshot_ref(name, &spec.version, ctx, bases)
                     .ok()
                     .map(|reference| (name.clone(), reference))
             })
             .collect::<HashMap<_, _>>();
-        LinkedWorkspaceProject { project, deduped_peer_resolutions }
+        LinkedWorkspaceProject { project, deduped_peer_resolutions: Some(deduped_peer_resolutions) }
     }
 
     /// The reference `peer` binds to through the deduped resolutions, if the
@@ -71,7 +60,7 @@ impl LinkedWorkspaceProject {
         snapshots: &HashMap<PkgNameVerPeer, SnapshotEntry>,
         peer: &PkgName,
     ) -> Option<SnapshotDepRef> {
-        let reference = self.deduped_peer_resolutions.get(peer)?;
+        let reference = self.deduped_peer_resolutions.as_ref()?.get(peer)?;
         reference
             .resolve(peer)
             .is_some_and(|key| snapshots.contains_key(&key))
@@ -81,12 +70,13 @@ impl LinkedWorkspaceProject {
 
 /// A linked workspace package has no package snapshot in the shared lockfile,
 /// so the importer its deployed snapshot is synthesized from carries no peer
-/// bindings. Bind each still-unresolved peer to the deployed graph's own
-/// resolution while that resolution is unambiguous, and refuse when it is not:
-/// picking between candidates is precisely the decision that injecting the
-/// package would have made, and it cannot be recovered afterwards. A peer
-/// whose source binding is still known, see
-/// [`LinkedWorkspaceProject::deduped_peer_resolutions`], binds to that instead.
+/// bindings. Bind each still-unresolved peer the way injecting the package
+/// would have: to what its parents provide, see [`ancestor_peer_providers`].
+/// A peer no ancestor provides binds to the deployed graph's own resolution
+/// while that is unambiguous. Deploy refuses when either choice is
+/// ambiguous: picking between candidates is precisely the decision that
+/// injecting the package would have made, and it cannot be recovered
+/// afterwards.
 pub(super) fn bind_singleton_peers(
     lockfile: &mut Lockfile,
     linked_workspace_projects: &HashMap<PkgNameVerPeer, LinkedWorkspaceProject>,
@@ -96,8 +86,13 @@ pub(super) fn bind_singleton_peers(
     }
     let Some(snapshots) = lockfile.snapshots.as_ref() else { return Ok(()) };
 
-    let candidates = resolution_candidates(lockfile, snapshots);
-    let bindings = collect_peer_bindings(snapshots, &candidates, linked_workspace_projects)?;
+    let graph = DeployedGraph {
+        importer: lockfile.importers.get(Lockfile::ROOT_IMPORTER_KEY),
+        snapshots,
+        candidates: resolution_candidates(lockfile, snapshots),
+        dependents: dependents_by_snapshot(lockfile, snapshots),
+    };
+    let bindings = collect_peer_bindings(&graph, linked_workspace_projects)?;
 
     let Some(snapshots) = lockfile.snapshots.as_mut() else { return Ok(()) };
     for (package_key, peer, reference) in bindings {
@@ -111,19 +106,17 @@ pub(super) fn bind_singleton_peers(
 /// The `(package, peer, reference)` triples the deployed graph can bind
 /// unambiguously.
 fn collect_peer_bindings(
-    snapshots: &HashMap<PkgNameVerPeer, SnapshotEntry>,
-    candidates: &HashMap<PkgName, HashSet<PkgNameVerPeer>>,
+    graph: &DeployedGraph<'_>,
     linked_workspace_projects: &HashMap<PkgNameVerPeer, LinkedWorkspaceProject>,
 ) -> miette::Result<Vec<(PkgNameVerPeer, PkgName, SnapshotDepRef)>> {
     let mut bindings = Vec::new();
     for (package_key, linked) in linked_workspace_projects {
-        if !snapshots.contains_key(package_key) {
+        if !graph.snapshots.contains_key(package_key) {
             continue;
         }
         for peer in &linked.project.peer_dependencies {
-            if let Some(binding) =
-                singleton_peer_binding(snapshots, candidates, package_key, linked, peer)?
-            {
+            let site = LinkedPeer { package_key, linked, peer };
+            if let Some(binding) = singleton_peer_binding(graph, &site)? {
                 bindings.push((package_key.clone(), peer.clone(), binding));
             }
         }
@@ -131,117 +124,99 @@ fn collect_peer_bindings(
     Ok(bindings)
 }
 
-/// Every snapshot key the deployed graph resolves, keyed by package name
-/// rather than by the reference that spelled it, so an npm-aliased edge
-/// and a plain one that name the same package count once.
-fn resolution_candidates(
-    lockfile: &Lockfile,
-    snapshots: &HashMap<PkgNameVerPeer, SnapshotEntry>,
-) -> HashMap<PkgName, HashSet<PkgNameVerPeer>> {
-    let importer_keys = lockfile.importers
-        .get(Lockfile::ROOT_IMPORTER_KEY)
-        .into_iter()
-        .flat_map(|importer| {
-            [
-                importer.dependencies.as_ref(),
-                importer.dev_dependencies.as_ref(),
-                importer.optional_dependencies.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|(alias, dependency)| dependency.version.resolved_key(alias))
-        });
-    let snapshot_keys = snapshots
-        .values()
-        .flat_map(|snapshot| {
-            [snapshot.dependencies.as_ref(), snapshot.optional_dependencies.as_ref()]
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter_map(|(alias, dependency)| dependency.resolve(alias))
-        });
-    let mut candidates: HashMap<PkgName, HashSet<PkgNameVerPeer>> = HashMap::new();
-    for key in importer_keys.chain(snapshot_keys) {
-        candidates
-            .entry(key.name.clone())
-            .or_default()
-            .insert(key);
+/// One peer of one linked workspace package.
+struct LinkedPeer<'a> {
+    package_key: &'a PkgNameVerPeer,
+    linked: &'a LinkedWorkspaceProject,
+    peer: &'a PkgName,
+}
+
+impl LinkedPeer<'_> {
+    /// Whether the package already binds the peer, or declares it as a
+    /// dependency.
+    ///
+    /// Either map already binding the peer counts: re-binding one the package
+    /// declares as an optional dependency would copy it into the required map
+    /// and quietly promote it. The graph prune clears the optional map before
+    /// this runs, so a peer the package depends on optionally is invisible in
+    /// the snapshot under `--no-optional`. Binding it there would resurrect a
+    /// dependency the flag excluded.
+    fn is_bound(&self, graph: &DeployedGraph<'_>) -> bool {
+        self.linked.project.declared_dependencies.contains(self.peer)
+            || graph.snapshots
+                .get(self.package_key)
+                .is_some_and(|snapshot| {
+                    snapshot_dependencies(snapshot).any(|(alias, _)| alias == self.peer)
+                })
     }
-    candidates
+
+    fn ambiguous(&self, versions: impl Iterator<Item = String>) -> miette::Report {
+        let mut versions = versions.collect::<Vec<_>>();
+        versions.sort();
+        DeployError::AmbiguousPeer {
+            package: self.linked.project.name
+                .clone()
+                .unwrap_or_else(|| self.package_key.to_string()),
+            peer: self.peer.to_string(),
+            versions: versions.join(", "),
+        }
+        .into()
+    }
 }
 
 /// The reference one still-unresolved peer binds to, if the deployed
 /// graph resolves it unambiguously.
 fn singleton_peer_binding(
-    snapshots: &HashMap<PkgNameVerPeer, SnapshotEntry>,
-    candidates: &HashMap<PkgName, HashSet<PkgNameVerPeer>>,
-    package_key: &PkgNameVerPeer,
-    linked: &LinkedWorkspaceProject,
-    peer: &PkgName,
+    graph: &DeployedGraph<'_>,
+    site: &LinkedPeer<'_>,
 ) -> miette::Result<Option<SnapshotDepRef>> {
-    let project = &linked.project;
-    // Either map already binding the peer counts: re-binding one the
-    // package declares as an optional dependency would copy it into the
-    // required map and quietly promote it.
-    // The graph prune clears the optional map before this runs, so a peer
-    // the package depends on optionally is invisible in the snapshot under
-    // `--no-optional`. Binding it there would resurrect a dependency the
-    // flag excluded.
-    if project.declared_dependencies.contains(peer) {
+    if site.is_bound(graph) {
         return Ok(None);
     }
-    let bound = snapshots
-        .get(package_key)
-        .is_some_and(|snapshot| {
-            [snapshot.dependencies.as_ref(), snapshot.optional_dependencies.as_ref()]
-                .into_iter()
-                .flatten()
-                .any(|dependencies| dependencies.contains_key(peer))
-        });
-    if bound {
-        return Ok(None);
-    }
-    if let Some(reference) = linked.deduped_peer_binding(snapshots, peer) {
+    if let Some(reference) = site.linked.deduped_peer_binding(graph.snapshots, site.peer) {
         return Ok(Some(reference));
     }
+    if let Some(reference) = ancestor_peer_binding(graph, site)? {
+        return Ok(Some(reference));
+    }
+    graph_peer_binding(graph, site)
+}
+
+/// What the ancestors of the package provide for the peer, see
+/// [`ancestor_peer_providers`].
+fn ancestor_peer_binding(
+    graph: &DeployedGraph<'_>,
+    site: &LinkedPeer<'_>,
+) -> miette::Result<Option<SnapshotDepRef>> {
+    match ancestor_peer_providers(graph, site.package_key, site.peer).as_slice() {
+        [] => Ok(None),
+        [reference] => Ok(Some(reference.clone())),
+        providers => Err(site.ambiguous(
+            providers
+                .iter()
+                .map(|reference| match reference.resolve(site.peer) {
+                    Some(key) => key.suffix.to_string(),
+                    None => reference.to_string(),
+                }),
+        )),
+    }
+}
+
+/// The deployed graph's only resolution of the peer.
+fn graph_peer_binding(
+    graph: &DeployedGraph<'_>,
+    site: &LinkedPeer<'_>,
+) -> miette::Result<Option<SnapshotDepRef>> {
     // A peer the deployed graph does not provide at all stays unresolved,
     // exactly as it is in the workspace this deploy was taken from.
-    let Some(resolutions) = candidates.get(peer) else { return Ok(None) };
+    let Some(resolutions) = graph.candidates.get(site.peer) else { return Ok(None) };
     if resolutions.len() > 1 {
-        let mut versions = resolutions
-            .iter()
-            .map(|key| key.suffix.to_string())
-            .collect::<Vec<_>>();
-        versions.sort();
-        return Err(DeployError::AmbiguousPeer {
-            package: project.name.clone().unwrap_or_else(|| package_key.to_string()),
-            peer: peer.to_string(),
-            versions: versions.join(", "),
-        }
-        .into());
+        return Err(site.ambiguous(resolutions.iter().map(|key| key.suffix.to_string())));
     }
     Ok(resolutions
         .iter()
         .next()
         .map(|resolution| SnapshotDepRef::Plain(resolution.suffix.clone())))
-}
-
-/// The peers `manifest` declares with a `workspace:` range.
-pub(super) fn workspace_protocol_peers(manifest: &PackageManifest) -> HashSet<PkgName> {
-    manifest
-        .value()
-        .get("peerDependencies")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flatten()
-        .filter(|(_, range)| {
-            range
-                .as_str()
-                .is_some_and(|range| range.starts_with("workspace:"))
-        })
-        .filter_map(|(name, _)| name.parse().ok())
-        .collect()
 }
 
 /// The source lockfile's peer-satisfaction edges, under the keys the deployed

@@ -85,14 +85,11 @@ function listRetainedEdgeTargets (
 export interface LinkedWorkspaceProject {
   manifest: ProjectManifest
   /**
-   * The project's dev dependencies that are also its peers and that the deploy
-   * keeps as the peer's binding when the deployed graph holds them.
-   * In an injected workspace that is every such dev dependency: there a
-   * workspace package is linked rather than injected only when its injected
-   * resolution matched its own importer, dev dependencies included, so a peer
-   * it also lists as a dev dependency was bound to exactly that.
-   * Without injection it is only a `workspace:` peer whose dev dependency links
-   * a workspace project.
+   * The project's dev dependencies that are also its peers, recorded only in
+   * an injected workspace.
+   * There a workspace package is linked rather than injected only when its
+   * injected resolution matched its own importer, dev dependencies included,
+   * so a peer it also lists as a dev dependency was bound to exactly that.
    */
   dedupedPeerResolutions: ResolvedDependencies | undefined
 }
@@ -103,13 +100,15 @@ export interface LinkedWorkspaceProject {
  *
  * A linked workspace package has no package snapshot in the shared lockfile, so
  * the importer its deployed snapshot is synthesized from carries no peer
- * bindings and they cannot be recovered afterwards. A peer already bound by
- * either dependency map, or absent from the deployed graph entirely, is left
- * alone.
+ * bindings and they cannot be recovered afterwards. Each one is bound the way
+ * injecting the package would bind it: to what its parents provide, see
+ * {@link findAncestorPeerReferences}. A peer no ancestor provides binds to the
+ * deployed graph's own resolution. A peer already bound by either dependency
+ * map, or absent from the deployed graph entirely, is left alone.
  *
- * @throws PnpmError DEPLOY_AMBIGUOUS_PEER when the deployed graph offers more
- * than one resolution for a peer, since choosing between them is precisely the
- * decision injecting the package would have made.
+ * @throws PnpmError DEPLOY_AMBIGUOUS_PEER when the ancestors, or else the
+ * deployed graph, offer more than one resolution for a peer, since choosing
+ * between them is precisely the decision injecting the package would have made.
  */
 export function bindSingletonPeers (
   importer: ProjectSnapshot,
@@ -118,19 +117,36 @@ export function bindSingletonPeers (
 ): void {
   if (linkedWorkspaceProjects.size === 0) return
 
-  const references = collectReferencesByName(importer, packages)
+  const graph: DeployedGraph = {
+    importer,
+    packages,
+    references: collectReferencesByName(importer, packages),
+    dependents: collectDependents(importer, packages),
+  }
   for (const [depPath, linkedProject] of linkedWorkspaceProjects) {
     const snapshot = packages[depPath]
     if (snapshot == null) continue
-    bindPeersOfLinkedProject(snapshot, { depPath, linkedProject, packages, references })
+    bindPeersOfLinkedProject(snapshot, { depPath, linkedProject, graph })
   }
+}
+
+/** The deployed project's node in {@link DeployedGraph.dependents}. */
+const IMPORTER = Symbol('importer')
+
+type Dependent = DepPath | typeof IMPORTER
+
+interface DeployedGraph {
+  importer: ProjectSnapshot
+  packages: PackageSnapshots
+  references: Map<string, Set<string>>
+  /** The nodes that depend on each snapshot. */
+  dependents: Map<DepPath, Dependent[]>
 }
 
 interface BindPeersContext {
   depPath: DepPath
   linkedProject: LinkedWorkspaceProject
-  packages: PackageSnapshots
-  references: Map<string, Set<string>>
+  graph: DeployedGraph
 }
 
 function bindPeersOfLinkedProject (snapshot: PackageSnapshot, ctx: BindPeersContext): void {
@@ -151,16 +167,21 @@ function bindPeersOfLinkedProject (snapshot: PackageSnapshot, ctx: BindPeersCont
 function pickPeerReference (peerName: string, ctx: BindPeersContext): string | undefined {
   const dedupedReference = findDedupedPeerReference(peerName, ctx)
   if (dedupedReference != null) return dedupedReference
-  const candidates = ctx.references.get(peerName)
+  const ancestorReferences = findAncestorPeerReferences(peerName, ctx)
+  if (ancestorReferences.size === 1) return Array.from(ancestorReferences.values())[0]
+  if (ancestorReferences.size > 1) throw ambiguousPeerError(peerName, Array.from(ancestorReferences.keys()), ctx)
+  const candidates = ctx.graph.references.get(peerName)
   // A peer the deployed graph does not provide at all stays unresolved,
   // exactly as it is in the workspace this deploy was taken from.
   if (candidates == null) return undefined
-  if (candidates.size > 1) {
-    throw new PnpmError('DEPLOY_AMBIGUOUS_PEER', `Workspace package '${ctx.linkedProject.manifest.name ?? ctx.depPath}' declares a peer dependency on '${peerName}', which resolves to more than one version (${Array.from(candidates).sort().join(', ')}) in the deployed graph. Without "injectWorkspacePackages" there is no snapshot to bind it to.`, {
-      hint: `Pin '${peerName}' to a single version with an "overrides" entry, set "injectWorkspacePackages" to true, or run "pnpm deploy" with the "--legacy" flag.`,
-    })
-  }
+  if (candidates.size > 1) throw ambiguousPeerError(peerName, Array.from(candidates), ctx)
   return Array.from(candidates)[0]
+}
+
+function ambiguousPeerError (peerName: string, versions: string[], ctx: BindPeersContext): PnpmError {
+  return new PnpmError('DEPLOY_AMBIGUOUS_PEER', `Workspace package '${ctx.linkedProject.manifest.name ?? ctx.depPath}' declares a peer dependency on '${peerName}', which resolves to more than one version (${versions.sort().join(', ')}) in the deployed graph. Without "injectWorkspacePackages" there is no snapshot to bind it to.`, {
+    hint: `Pin '${peerName}' to a single version with an "overrides" entry, set "injectWorkspacePackages" to true, or run "pnpm deploy" with the "--legacy" flag.`,
+  })
 }
 
 function findDedupedPeerReference (peerName: string, ctx: BindPeersContext): string | undefined {
@@ -169,7 +190,75 @@ function findDedupedPeerReference (peerName: string, ctx: BindPeersContext): str
   const dedupedReference = dedupedPeerResolutions[peerName]
   if (dedupedReference == null) return undefined
   const dedupedDepPath = dp.refToRelative(dedupedReference, peerName)
-  return dedupedDepPath != null && ctx.packages[dedupedDepPath] != null ? dedupedReference : undefined
+  return dedupedDepPath != null && ctx.graph.packages[dedupedDepPath] != null ? dedupedReference : undefined
+}
+
+/**
+ * The references the nearest ancestors of the linked package that depend on
+ * `peerName` resolve it to, one per path up the graph, the same way injecting
+ * the package would resolve its peer from its parents. An ancestor that does
+ * not depend on `peerName` passes the search on to its own dependents.
+ *
+ * Keyed by the version the reference resolves to, so two spellings of one
+ * package count once.
+ */
+function findAncestorPeerReferences (peerName: string, ctx: BindPeersContext): Map<string, string> {
+  const { graph } = ctx
+  const references = new Map<string, string>()
+  const visited = new Set<DepPath>([ctx.depPath])
+  const queue: DepPath[] = [ctx.depPath]
+  for (let depPath = queue.shift(); depPath != null; depPath = queue.shift()) {
+    for (const dependent of graph.dependents.get(depPath) ?? []) {
+      const reference = providedPeerReference(graph, dependent, peerName)
+      if (reference != null) {
+        references.set(referenceVersion(reference, peerName), reference)
+      } else if (dependent !== IMPORTER && !visited.has(dependent)) {
+        visited.add(dependent)
+        queue.push(dependent)
+      }
+    }
+  }
+  return references
+}
+
+/** The reference `dependent` resolves `peerName` to, if it depends on it. */
+function providedPeerReference (graph: DeployedGraph, dependent: Dependent, peerName: string): string | undefined {
+  const dependencyMaps = dependent === IMPORTER
+    ? [graph.importer.dependencies, graph.importer.devDependencies, graph.importer.optionalDependencies]
+    : [graph.packages[dependent]?.dependencies, graph.packages[dependent]?.optionalDependencies]
+  const providing = dependencyMaps.find(dependencies => dependencies != null && Object.hasOwn(dependencies, peerName))
+  return providing?.[peerName]
+}
+
+/** The version part of the dependency path `reference` resolves to. */
+function referenceVersion (reference: string, alias: string): string {
+  const depPath = dp.refToRelative(reference, alias)
+  if (depPath == null) return reference
+  const { name } = dp.parse(depPath)
+  return name == null ? depPath : depPath.slice(name.length + 1)
+}
+
+function collectDependents (importer: ProjectSnapshot, packages: PackageSnapshots): Map<DepPath, Dependent[]> {
+  const dependents = new Map<DepPath, Dependent[]>()
+  addDependents(dependents, IMPORTER, [importer.dependencies, importer.devDependencies, importer.optionalDependencies])
+  for (const [depPath, snapshot] of Object.entries(packages) as Array<[DepPath, PackageSnapshot]>) {
+    addDependents(dependents, depPath, [snapshot.dependencies, snapshot.optionalDependencies])
+  }
+  return dependents
+}
+
+function addDependents (
+  dependents: Map<DepPath, Dependent[]>,
+  dependent: Dependent,
+  dependencyMaps: Array<ResolvedDependencies | undefined>
+): void {
+  for (const [alias, reference] of dependencyMaps.flatMap(dependencies => Object.entries(dependencies ?? {}))) {
+    const child = dp.refToRelative(reference, alias)
+    if (child == null) continue
+    let dependentsOfChild = dependents.get(child)
+    if (dependentsOfChild == null) dependents.set(child, dependentsOfChild = [])
+    dependentsOfChild.push(dependent)
+  }
 }
 
 /**

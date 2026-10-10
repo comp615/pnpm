@@ -97,6 +97,8 @@ fn shared_lockfile_deploy_binds_a_singleton_peer_outside_the_declared_range() {
     drop((root, mock_instance));
 }
 
+/// No ancestor of `lib` depends on its peer, and the deployed graph holds two
+/// versions of it, so nothing says which one injecting `lib` would bind.
 #[test]
 fn shared_lockfile_deploy_refuses_a_linked_workspace_package_with_an_ambiguous_peer() {
     let CommandTempCwd {
@@ -108,6 +110,30 @@ fn shared_lockfile_deploy_refuses_a_linked_workspace_package_with_an_ambiguous_p
     } = CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
     write_ambiguous_peer_workspace(&workspace);
+    write_project(
+        &workspace,
+        "other-v1-0-0",
+        &serde_json::json!({
+            "name": "other-v1-0-0",
+            "version": "1.0.0",
+            "files": ["index.js"],
+            "dependencies": { "@pnpm.e2e/peer-a": "1.0.0" },
+        }),
+    );
+    write_project(
+        &workspace,
+        "app",
+        &serde_json::json!({
+            "name": "app",
+            "version": "1.0.0",
+            "files": ["index.js"],
+            "dependencies": {
+                "lib": "workspace:*",
+                "other": "workspace:*",
+                "other-v1-0-0": "workspace:*",
+            },
+        }),
+    );
 
     pacquet
         .with_arg("install")
@@ -131,6 +157,37 @@ fn shared_lockfile_deploy_refuses_a_linked_workspace_package_with_an_ambiguous_p
     ] {
         assert!(stderr.contains(expected), "stderr should mention {expected}:\n{stderr}");
     }
+
+    drop((root, mock_instance));
+}
+
+/// `app` depends on the peer itself, so injecting `lib` would bind `app`'s
+/// version, whichever other versions the deployed graph holds.
+#[test]
+fn shared_lockfile_deploy_binds_a_linked_peer_to_the_version_its_parent_provides() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    write_ambiguous_peer_workspace(&workspace);
+
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+    let deploy_dir = fs::canonicalize(root.path()).unwrap().join("deploy");
+    pacquet_cmd(&workspace)
+        .with_args(["--filter", "app", "deploy", "--prod"])
+        .with_arg(&deploy_dir)
+        .assert()
+        .success();
+
+    assert_eq!(dependency_version(&deploy_dir, "lib", "@pnpm.e2e/peer-a"), "1.0.0");
+    assert_eq!(dependency_version(&deploy_dir, "other", "@pnpm.e2e/peer-a"), "1.0.1");
 
     drop((root, mock_instance));
 }
@@ -427,13 +484,13 @@ fn shared_lockfile_deploy_does_not_resurrect_an_excluded_optional_peer() {
 }
 
 /// `lib` declares `workspace:^` for its peer and lists the same as a dev
-/// dependency, so the workspace links the peer next to it, but records that
-/// link only in `lib`'s devDependencies, which a production deploy drops.
-/// `other` brings a registry copy of the peer into the deployed graph. The
-/// deploy keeps the recorded workspace link rather than refusing over the two
-/// candidates, and leaves `other` on its registry copy.
+/// dependency, which the source lockfile records only in `lib`'s
+/// devDependencies. `app` depends on the workspace project itself, and `other`
+/// brings a registry copy into the deployed graph. `lib` binds to what `app`
+/// provides, and `other` keeps its registry copy.
 #[test]
-fn shared_lockfile_deploy_keeps_the_dev_link_of_a_workspace_protocol_peer() {
+fn shared_lockfile_deploy_binds_a_workspace_protocol_peer_to_the_workspace_project_its_parent_provides()
+ {
     let CommandTempCwd {
         pacquet,
         root,
@@ -472,12 +529,12 @@ fn shared_lockfile_deploy_keeps_the_dev_link_of_a_workspace_protocol_peer() {
     drop((root, mock_instance));
 }
 
-/// A `workspace:` range alone does not pick a candidate. `lib` records no
-/// binding of its peer, so injecting it would bind `app`'s registry copy, while
-/// the deployed graph also holds the workspace project through `other`. The
-/// deploy refuses rather than guessing.
+/// `app` depends on a registry copy of the peer while `other` brings the
+/// workspace project into the deployed graph. `lib`'s `workspace:` peer binds
+/// to what its parent provides, as a direct dependency overrides the peer.
 #[test]
-fn shared_lockfile_deploy_refuses_a_workspace_protocol_peer_without_a_recorded_link() {
+fn shared_lockfile_deploy_binds_a_workspace_protocol_peer_to_the_registry_copy_its_parent_provides()
+{
     let CommandTempCwd {
         pacquet,
         root,
@@ -527,25 +584,22 @@ fn shared_lockfile_deploy_refuses_a_workspace_protocol_peer_without_a_recorded_l
         .assert()
         .success();
     let deploy_dir = fs::canonicalize(root.path()).unwrap().join("deploy");
-    let output = pacquet_cmd(&workspace)
+    pacquet_cmd(&workspace)
         .with_args(["--filter", "app", "deploy", "--prod"])
         .with_arg(&deploy_dir)
-        .output()
-        .expect("run pacquet deploy");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("ERR_PNPM_DEPLOY_AMBIGUOUS_PEER"),
-        "stderr should mention ERR_PNPM_DEPLOY_AMBIGUOUS_PEER:\n{stderr}",
-    );
+        .assert()
+        .success();
+
+    assert_eq!(dependency_version(&deploy_dir, "lib", "@pnpm.e2e/peer-a"), "1.0.0");
+    assert_eq!(dependency_version(&deploy_dir, "other", "@pnpm.e2e/peer-a"), "2.0.0");
 
     drop((root, mock_instance));
 }
 
-/// The recorded link binds the peer under its own alias, so an aliased
-/// `workspace:` peer resolves to exactly the project the alias names.
+/// `app` provides the peer under the alias `lib` declares it with, so the
+/// binding keeps the alias and resolves to the project the alias names.
 #[test]
-fn shared_lockfile_deploy_keeps_the_dev_link_of_an_aliased_workspace_protocol_peer() {
+fn shared_lockfile_deploy_binds_an_aliased_peer_to_what_its_parent_provides() {
     let CommandTempCwd {
         pacquet,
         root,
@@ -566,17 +620,25 @@ fn shared_lockfile_deploy_keeps_the_dev_link_of_an_aliased_workspace_protocol_pe
             "devDependencies": { "compat": "workspace:@pnpm.e2e/peer-a@*" },
         }),
     );
+    write_project(
+        &workspace,
+        "app",
+        &serde_json::json!({
+            "name": "app",
+            "version": "1.0.0",
+            "files": ["index.js"],
+            "dependencies": {
+                "lib": "workspace:*",
+                "other": "workspace:*",
+                "compat": "workspace:@pnpm.e2e/peer-a@*",
+            },
+        }),
+    );
 
     pacquet
         .with_arg("install")
         .assert()
         .success();
-    let workspace_lockfile = Lockfile::load_wanted_from_dir(&workspace).unwrap().unwrap();
-    let compat: PkgName = "compat".parse().unwrap();
-    let dev_version =
-        &workspace_lockfile.importers["packages/lib"].dev_dependencies.as_ref().unwrap()[&compat]
-            .version;
-    assert_eq!(dev_version.to_string(), "link:../peer-a");
     let deploy_dir = fs::canonicalize(root.path()).unwrap().join("deploy");
     pacquet_cmd(&workspace)
         .with_args(["--filter", "app", "deploy", "--prod"])
@@ -589,6 +651,75 @@ fn shared_lockfile_deploy_keeps_the_dev_link_of_an_aliased_workspace_protocol_pe
     drop((root, mock_instance));
 }
 
+/// `mid` does not depend on `lib`'s peer, so the search continues to `app`,
+/// which does.
+#[test]
+fn shared_lockfile_deploy_binds_a_linked_peer_to_what_an_ancestor_provides() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    write_workspace_protocol_peer_workspace(&workspace);
+    write_project(
+        &workspace,
+        "mid",
+        &serde_json::json!({
+            "name": "mid",
+            "version": "1.0.0",
+            "files": ["index.js"],
+            "dependencies": { "lib": "workspace:*" },
+        }),
+    );
+    write_project(
+        &workspace,
+        "app",
+        &serde_json::json!({
+            "name": "app",
+            "version": "1.0.0",
+            "files": ["index.js"],
+            "dependencies": {
+                "mid": "workspace:*",
+                "other": "workspace:*",
+                "@pnpm.e2e/peer-a": "workspace:^",
+            },
+        }),
+    );
+
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+    let deploy_dir = fs::canonicalize(root.path()).unwrap().join("deploy");
+    pacquet_cmd(&workspace)
+        .with_args(["--filter", "app", "deploy", "--prod"])
+        .with_arg(&deploy_dir)
+        .assert()
+        .success();
+
+    let lib_dir = fs::canonicalize(deploy_dir.join("node_modules/mid"))
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("lib");
+    let peer_manifest: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(
+            fs::canonicalize(lib_dir)
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("@pnpm.e2e/peer-a/package.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(peer_manifest["version"], "2.0.0");
+
+    drop((root, mock_instance));
+}
 /// Without a dev dependency on its peer, `autoInstallPeers` installs it as a
 /// dependency of `lib`, which binds the peer before the deploy has to.
 #[test]
@@ -629,55 +760,6 @@ fn shared_lockfile_deploy_keeps_an_auto_installed_workspace_protocol_peer() {
         .success();
 
     assert_eq!(dependency_version(&deploy_dir, "lib", "@pnpm.e2e/peer-a"), "2.0.0");
-
-    drop((root, mock_instance));
-}
-
-/// The recorded link binds only when the deployed graph holds its target. Here
-/// `app` and `other` each bring a different registry copy of the peer and
-/// nothing deployed depends on the workspace project, so the deploy falls back
-/// to the ambiguity check.
-#[test]
-fn shared_lockfile_deploy_refuses_a_workspace_protocol_peer_without_the_workspace_project() {
-    let CommandTempCwd {
-        pacquet,
-        root,
-        workspace,
-        npmrc_info,
-        ..
-    } = CommandTempCwd::init().add_mocked_registry();
-    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
-    write_workspace_protocol_peer_workspace(&workspace);
-    write_project(
-        &workspace,
-        "app",
-        &serde_json::json!({
-            "name": "app",
-            "version": "1.0.0",
-            "files": ["index.js"],
-            "dependencies": {
-                "lib": "workspace:*",
-                "other": "workspace:*",
-                "@pnpm.e2e/peer-a": "1.0.0",
-            },
-        }),
-    );
-
-    pacquet
-        .with_arg("install")
-        .assert()
-        .success();
-    let deploy_dir = fs::canonicalize(root.path()).unwrap().join("deploy");
-    let output = pacquet_cmd(&workspace)
-        .with_args(["--filter", "app", "deploy", "--prod"])
-        .with_arg(&deploy_dir)
-        .output()
-        .expect("run pacquet deploy");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    for expected in ["ERR_PNPM_DEPLOY_AMBIGUOUS_PEER", "more than one version (1.0.0, 1.0.1)"] {
-        assert!(stderr.contains(expected), "stderr should mention {expected}:\n{stderr}");
-    }
 
     drop((root, mock_instance));
 }

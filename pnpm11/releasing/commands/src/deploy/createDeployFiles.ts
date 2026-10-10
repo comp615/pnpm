@@ -140,10 +140,7 @@ function convertWorkspaceImporters (
 ): Map<DepPath, LinkedWorkspaceProject> {
   const peerBearingProjects = indexPeerBearingProjects(opts.allProjects)
   const linkedWorkspaceProjects = new Map<DepPath, LinkedWorkspaceProject>()
-  const peerContext: RecordedPeerContext = {
-    injectedWorkspace: opts.lockfile.settings?.injectWorkspacePackages === true,
-    workspaceProjectDirs: indexWorkspaceProjectDirs(opts.allProjects),
-  }
+  const injectedWorkspace = opts.lockfile.settings?.injectWorkspacePackages === true
   for (const importerPath in opts.lockfile.importers) {
     if (importerPath === opts.projectId) continue
     const projectSnapshot = opts.lockfile.importers[importerPath as ProjectId]
@@ -162,52 +159,15 @@ function convertWorkspaceImporters (
     if (manifest == null) continue
     linkedWorkspaceProjects.set(depPath, {
       manifest,
-      dedupedPeerResolutions: recordedPeerResolutions(manifest, projectSnapshot, { ...peerContext, convertOptions }),
+      dedupedPeerResolutions: injectedWorkspace
+        ? convertResolvedDependencies(
+          pickOwn(Object.keys(manifest.peerDependencies ?? {}), projectSnapshot.devDependencies ?? {}),
+          convertOptions
+        )
+        : undefined,
     })
   }
   return linkedWorkspaceProjects
-}
-
-interface RecordedPeerContext {
-  injectedWorkspace: boolean
-  /** Both spellings of every workspace project directory. */
-  workspaceProjectDirs: Set<string>
-}
-
-function recordedPeerResolutions (
-  manifest: ProjectManifest,
-  projectSnapshot: ProjectSnapshot,
-  ctx: RecordedPeerContext & { convertOptions: ConvertOptions }
-): ResolvedDependencies | undefined {
-  const devDependencies = projectSnapshot.devDependencies ?? {}
-  const recordedPeers = Object.entries(manifest.peerDependencies ?? {})
-    .filter(([peerName, peerRange]) =>
-      Object.hasOwn(devDependencies, peerName) &&
-      (ctx.injectedWorkspace || isRecordedWorkspaceProtocolPeerLink(peerRange, devDependencies[peerName], ctx))
-    )
-    .map(([peerName]) => peerName)
-  return convertResolvedDependencies(pick(recordedPeers, devDependencies), ctx.convertOptions)
-}
-
-/**
- * Without injection, a linked package's dev dependencies say nothing about what
- * injecting it would bind. The one exception to approximating that choice is a
- * peer declared with a `workspace:` range whose dev dependency links a
- * workspace project: the range admits only that project, and the workspace
- * links it there.
- */
-function isRecordedWorkspaceProtocolPeerLink (
-  peerRange: string,
-  devReference: string,
-  ctx: Pick<RecordedPeerContext, 'workspaceProjectDirs'> & { convertOptions: ConvertOptions }
-): boolean {
-  if (!peerRange.startsWith('workspace:') || !devReference.startsWith('link:')) return false
-  const target = resolveLinkOrFile(devReference, ctx.convertOptions)
-  return target != null && ctx.workspaceProjectDirs.has(target.resolvedPath)
-}
-
-function indexWorkspaceProjectDirs (allProjects: DeployAllProjects): Set<string> {
-  return new Set(allProjects.flatMap(project => [project.rootDir, project.rootDirRealPath]))
 }
 
 /**
@@ -374,4 +334,12 @@ function dependencyNames (source: ProjectManifest | ProjectSnapshot): Set<string
 function omitKeys<Value> (record: Record<string, Value> | undefined, keys: Set<string>): Record<string, Value> | undefined {
   if (record == null) return undefined
   return Object.fromEntries(Object.entries(record).filter(([key]) => !keys.has(key)))
+}
+
+/**
+ * `ramda`'s `pick` also copies inherited properties, so a peer named after an
+ * `Object.prototype` member, such as `constructor`, would pick up that member.
+ */
+function pickOwn (names: string[], dependencies: ResolvedDependencies): ResolvedDependencies {
+  return Object.fromEntries(names.filter(name => Object.hasOwn(dependencies, name)).map(name => [name, dependencies[name]]))
 }
