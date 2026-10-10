@@ -134,7 +134,9 @@ impl<'a> ProviderSearch<'a> {
     /// dependents.
     fn visit(&mut self, graph: &DeployedGraph<'a>, dependent: Dependent<'a>, peer: &PkgName) {
         match (provided_peer(graph, dependent, peer), dependent) {
-            (Some(reference), _) if !self.providers.contains(&reference) => {
+            (Some(reference), _)
+                if !self.providers.iter().any(|known| same_target(known, &reference, peer)) =>
+            {
                 self.providers.push(reference);
             }
             (None, Dependent::Snapshot(parent)) if self.visited.insert(parent) => {
@@ -179,4 +181,13 @@ fn importer_version_to_snapshot_ref(
     } else {
         SnapshotDepRef::Alias(key)
     })
+}
+
+/// Whether two references to `peer` name the same package, however each is
+/// spelled.
+fn same_target(left: &SnapshotDepRef, right: &SnapshotDepRef, peer: &PkgName) -> bool {
+    match (left.resolve(peer), right.resolve(peer)) {
+        (Some(left), Some(right)) => left == right,
+        _ => left == right,
+    }
 }

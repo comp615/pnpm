@@ -836,6 +836,70 @@ test('native deploy binds a workspace: peer of a linked workspace package to the
   expect(deployedPeerVersion('project-4')).toBe('2.0.0')
 })
 
+// project-3 and project-5 both provide project-2's peer, as two different
+// packages at the same version, so injecting project-2 under each would bind a
+// different one.
+test('native deploy refuses a linked workspace package peer its parents provide as different packages', async () => {
+  preparePackages([
+    {
+      location: '.',
+      package: {
+        name: 'root',
+        version: '1.0.0',
+        private: true,
+      },
+    },
+    {
+      name: 'project-1',
+      version: '1.0.0',
+      dependencies: {
+        'project-3': 'workspace:*',
+        'project-5': 'workspace:*',
+      },
+    },
+    {
+      name: 'project-2',
+      version: '1.0.0',
+      peerDependencies: {
+        '@pnpm.e2e/peer-a': '*',
+      },
+    },
+    {
+      name: 'project-3',
+      version: '1.0.0',
+      dependencies: {
+        'project-2': 'workspace:*',
+        '@pnpm.e2e/peer-a': '1.0.0',
+      },
+    },
+    {
+      name: 'project-5',
+      version: '1.0.0',
+      dependencies: {
+        'project-2': 'workspace:*',
+        '@pnpm.e2e/peer-a': 'npm:@pnpm.e2e/peer-b@1.0.0',
+      },
+    },
+  ])
+
+  const { allProjects, selectedProjectsGraph } = await filterProjectsBySelectorObjectsFromDir(process.cwd(), [{ namePattern: 'project-1' }])
+  const opts = {
+    ...DEFAULT_OPTS,
+    allProjects,
+    autoInstallPeers: false,
+    dir: process.cwd(),
+    injectWorkspacePackages: false,
+    lockfileDir: process.cwd(),
+    sharedWorkspaceLockfile: true,
+    workspaceDir: process.cwd(),
+  }
+
+  await install.handler(opts)
+  await expect(
+    deploy.handler({ ...opts, production: true, recursive: true, selectedProjectsGraph }, ['deploy'])
+  ).rejects.toMatchObject({ code: 'ERR_PNPM_DEPLOY_AMBIGUOUS_PEER' })
+})
+
 // project-3 does not depend on project-2's peer, so the search continues to
 // project-1, which does.
 test('native deploy binds a linked workspace package peer to what an ancestor provides', async () => {

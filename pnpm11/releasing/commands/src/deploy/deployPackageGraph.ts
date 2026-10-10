@@ -169,7 +169,9 @@ function pickPeerReference (peerName: string, ctx: BindPeersContext): string | u
   if (dedupedReference != null) return dedupedReference
   const ancestorReferences = findAncestorPeerReferences(peerName, ctx)
   if (ancestorReferences.size === 1) return Array.from(ancestorReferences.values())[0]
-  if (ancestorReferences.size > 1) throw ambiguousPeerError(peerName, Array.from(ancestorReferences.keys()), ctx)
+  if (ancestorReferences.size > 1) {
+    throw ambiguousPeerError(peerName, Array.from(ancestorReferences.values(), reference => referenceVersion(reference, peerName)), ctx)
+  }
   const candidates = ctx.graph.references.get(peerName)
   // A peer the deployed graph does not provide at all stays unresolved,
   // exactly as it is in the workspace this deploy was taken from.
@@ -199,8 +201,8 @@ function findDedupedPeerReference (peerName: string, ctx: BindPeersContext): str
  * the package would resolve its peer from its parents. An ancestor that does
  * not depend on `peerName` passes the search on to its own dependents.
  *
- * Keyed by the version the reference resolves to, so two spellings of one
- * package count once.
+ * Keyed by the dependency path the reference resolves to, so two spellings of
+ * one package count once and two packages at one version do not.
  */
 function findAncestorPeerReferences (peerName: string, ctx: BindPeersContext): Map<string, string> {
   const { graph } = ctx
@@ -211,7 +213,7 @@ function findAncestorPeerReferences (peerName: string, ctx: BindPeersContext): M
     for (const dependent of graph.dependents.get(depPath) ?? []) {
       const reference = providedPeerReference(graph, dependent, peerName)
       if (reference != null) {
-        references.set(referenceVersion(reference, peerName), reference)
+        references.set(dp.refToRelative(reference, peerName) ?? reference, reference)
       } else if (dependent !== IMPORTER && !visited.has(dependent)) {
         visited.add(dependent)
         queue.push(dependent)

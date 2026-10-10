@@ -720,6 +720,63 @@ fn shared_lockfile_deploy_binds_a_linked_peer_to_what_an_ancestor_provides() {
 
     drop((root, mock_instance));
 }
+
+/// `mid` and `mid-2` both provide `lib`'s peer, as two different packages at
+/// the same version, so injecting `lib` under each would bind a different one.
+#[test]
+fn shared_lockfile_deploy_refuses_a_peer_its_parents_provide_as_different_packages() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    write_peer_workspace(&workspace);
+    for (name, peer) in [("mid", "1.0.0"), ("mid-2", "npm:@pnpm.e2e/peer-b@1.0.0")] {
+        write_project(
+            &workspace,
+            name,
+            &serde_json::json!({
+                "name": name,
+                "version": "1.0.0",
+                "files": ["index.js"],
+                "dependencies": { "lib": "workspace:*", "@pnpm.e2e/peer-a": peer },
+            }),
+        );
+    }
+    write_project(
+        &workspace,
+        "app",
+        &serde_json::json!({
+            "name": "app",
+            "version": "1.0.0",
+            "files": ["index.js"],
+            "dependencies": { "mid": "workspace:*", "mid-2": "workspace:*" },
+        }),
+    );
+
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+    let deploy_dir = fs::canonicalize(root.path()).unwrap().join("deploy");
+    let output = pacquet_cmd(&workspace)
+        .with_args(["--filter", "app", "deploy", "--prod"])
+        .with_arg(&deploy_dir)
+        .output()
+        .expect("run pacquet deploy");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ERR_PNPM_DEPLOY_AMBIGUOUS_PEER"),
+        "stderr should mention ERR_PNPM_DEPLOY_AMBIGUOUS_PEER:\n{stderr}",
+    );
+
+    drop((root, mock_instance));
+}
+
 /// Without a dev dependency on its peer, `autoInstallPeers` installs it as a
 /// dependency of `lib`, which binds the peer before the deploy has to.
 #[test]
