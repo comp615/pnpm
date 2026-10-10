@@ -284,12 +284,26 @@ function collectDependents (
   const dependents = new Map<DepPath, Dependent[]>()
   addDependents(dependents, IMPORTER, [importer.dependencies, importer.devDependencies, importer.optionalDependencies])
   for (const [depPath, snapshot] of Object.entries(packages) as Array<[DepPath, PackageSnapshot]>) {
-    const peers = linkedWorkspaceProjects.get(depPath)?.manifest.peerDependencies ?? snapshot.peerDependencies ?? {}
+    const isPeerOnly = peerOnlyAliases(snapshot, linkedWorkspaceProjects.get(depPath)?.manifest)
     const nonPeerDependencies = [snapshot.dependencies, snapshot.optionalDependencies]
-      .map(dependencies => dependencies && Object.fromEntries(Object.entries(dependencies).filter(([alias]) => !Object.hasOwn(peers, alias))))
+      .map(dependencies => dependencies && Object.fromEntries(Object.entries(dependencies).filter(([alias]) => !isPeerOnly(alias))))
     addDependents(dependents, depPath, nonPeerDependencies)
   }
   return dependents
+}
+
+/**
+ * The aliases a snapshot depends on only to satisfy its own peers. A linked
+ * workspace package that also depends on a peer resolves it as that
+ * dependency.
+ */
+function peerOnlyAliases (snapshot: PackageSnapshot, manifest: ProjectManifest | undefined): (alias: string) => boolean {
+  if (manifest == null) {
+    const peers = snapshot.peerDependencies ?? {}
+    return alias => Object.hasOwn(peers, alias)
+  }
+  const peers = manifest.peerDependencies ?? {}
+  return alias => Object.hasOwn(peers, alias) && !declaresDependency(manifest, alias)
 }
 
 function addDependents (

@@ -2,7 +2,7 @@ import { expect, test } from '@jest/globals'
 import type { PackageSnapshot, PackageSnapshots, ProjectSnapshot, ResolvedDependencies } from '@pnpm/lockfile.types'
 import type { DepPath } from '@pnpm/types'
 
-import { bindSingletonPeers } from '../../src/deploy/deployPackageGraph.js'
+import { bindSingletonPeers, type LinkedWorkspaceProject } from '../../src/deploy/deployPackageGraph.js'
 
 const LIB = 'lib@file:lib' as DepPath
 
@@ -65,4 +65,31 @@ test('bindSingletonPeers does not treat a package consuming the linked package a
     dedupedPeerResolutions: undefined,
   }]]))
   expect(packages[LIB].dependencies?.peer).toBe('1.0.0')
+})
+
+// consumer lists lib as both a dependency and a peer, so the dependency wins
+// and consumer is lib's parent, the only one.
+test('bindSingletonPeers binds to a parent that also declares the linked package as a peer', () => {
+  const CONSUMER = 'consumer@file:consumer' as DepPath
+  const importer: ProjectSnapshot = {
+    specifiers: {},
+    dependencies: { consumer: 'file:consumer', peer: '1.0.0' },
+  }
+  const packages: PackageSnapshots = {
+    [LIB]: snapshot(),
+    [CONSUMER]: snapshot({ lib: 'file:lib', peer: '1.0.1' }),
+    ['peer@1.0.0' as DepPath]: snapshot(),
+    ['peer@1.0.1' as DepPath]: snapshot(),
+  }
+  bindSingletonPeers(importer, packages, new Map<DepPath, LinkedWorkspaceProject>([
+    [LIB, {
+      manifest: { name: 'lib', version: '1.0.0', peerDependencies: { peer: '*' } },
+      dedupedPeerResolutions: undefined,
+    }],
+    [CONSUMER, {
+      manifest: { name: 'consumer', version: '1.0.0', dependencies: { lib: 'workspace:*' }, peerDependencies: { lib: 'workspace:*' } },
+      dedupedPeerResolutions: undefined,
+    }],
+  ]))
+  expect(packages[LIB].dependencies?.peer).toBe('1.0.1')
 })

@@ -107,7 +107,9 @@ pub(super) fn bind_singleton_peers(
 }
 
 /// Whether the package at `key` declares `alias` as a peer dependency, in its
-/// lockfile metadata or, for a linked workspace package, in its manifest.
+/// lockfile metadata or, for a linked workspace package, in its manifest. A
+/// linked package that also depends on `alias` resolves it as that
+/// dependency.
 fn declares_peer(
     lockfile: &Lockfile,
     linked_workspace_projects: &HashMap<PkgNameVerPeer, LinkedWorkspaceProject>,
@@ -115,7 +117,8 @@ fn declares_peer(
     alias: &PkgName,
 ) -> bool {
     if let Some(linked) = linked_workspace_projects.get(key) {
-        return linked.project.peer_dependencies.contains(alias);
+        return linked.project.peer_dependencies.contains(alias)
+            && !linked.project.declared_dependencies.contains(alias);
     }
     lockfile.packages
         .as_ref()
