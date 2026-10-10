@@ -91,7 +91,9 @@ pub(super) fn bind_singleton_peers(
         importer,
         snapshots,
         candidates: resolution_candidates(importer, snapshots),
-        dependents: dependents_by_snapshot(importer, snapshots),
+        dependents: dependents_by_snapshot(importer, snapshots, |parent, alias| {
+            declares_peer(lockfile, linked_workspace_projects, parent, alias)
+        }),
     };
     let bindings = collect_peer_bindings(&graph, linked_workspace_projects)?;
 
@@ -102,6 +104,24 @@ pub(super) fn bind_singleton_peers(
         }
     }
     Ok(())
+}
+
+/// Whether the package at `key` declares `alias` as a peer dependency, in its
+/// lockfile metadata or, for a linked workspace package, in its manifest.
+fn declares_peer(
+    lockfile: &Lockfile,
+    linked_workspace_projects: &HashMap<PkgNameVerPeer, LinkedWorkspaceProject>,
+    key: &PkgNameVerPeer,
+    alias: &PkgName,
+) -> bool {
+    if let Some(linked) = linked_workspace_projects.get(key) {
+        return linked.project.peer_dependencies.contains(alias);
+    }
+    lockfile.packages
+        .as_ref()
+        .and_then(|packages| packages.get(&key.without_peer()))
+        .and_then(|metadata| metadata.peer_dependencies.as_ref())
+        .is_some_and(|peers| peers.contains_key(&alias.to_string()))
 }
 
 /// The `(package, peer, reference)` triples the deployed graph can bind

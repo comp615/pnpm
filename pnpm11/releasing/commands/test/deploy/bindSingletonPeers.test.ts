@@ -46,3 +46,23 @@ test('bindSingletonPeers refuses a link into a providing package next to another
     code: 'ERR_PNPM_DEPLOY_AMBIGUOUS_PEER',
   }))
 })
+
+// sibling consumes lib as a peer, so it is not lib's parent, and its own copy
+// of the peer does not compete with the deployed project's.
+test('bindSingletonPeers does not treat a package consuming the linked package as a peer as its parent', () => {
+  const importer: ProjectSnapshot = {
+    specifiers: {},
+    dependencies: { lib: 'file:lib', sibling: '1.0.0', peer: '1.0.0' },
+  }
+  const packages: PackageSnapshots = {
+    [LIB]: snapshot(),
+    ['sibling@1.0.0' as DepPath]: { ...snapshot({ lib: 'file:lib', peer: '2.0.0' }), peerDependencies: { lib: '*' } },
+    ['peer@1.0.0' as DepPath]: snapshot(),
+    ['peer@2.0.0' as DepPath]: snapshot(),
+  }
+  bindSingletonPeers(importer, packages, new Map([[LIB, {
+    manifest: { name: 'lib', version: '1.0.0', peerDependencies: { peer: '*' } },
+    dedupedPeerResolutions: undefined,
+  }]]))
+  expect(packages[LIB].dependencies?.peer).toBe('1.0.0')
+})

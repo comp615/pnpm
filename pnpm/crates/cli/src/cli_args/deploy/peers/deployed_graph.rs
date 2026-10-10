@@ -43,21 +43,28 @@ pub(super) fn resolution_candidates(
     candidates
 }
 
-/// The nodes that depend on each snapshot of the deployed graph.
+/// The nodes that depend on each snapshot of the deployed graph, leaving out
+/// an edge from `parent` under an alias that `is_peer_of(parent, alias)`.
 pub(super) fn dependents_by_snapshot<'a>(
     importer: Option<&'a ProjectSnapshot>,
     snapshots: &'a HashMap<PkgNameVerPeer, SnapshotEntry>,
+    is_peer_of: impl Fn(&PkgNameVerPeer, &PkgName) -> bool,
 ) -> HashMap<PkgNameVerPeer, Vec<Dependent<'a>>> {
     let importer_edges = importer_dependencies(importer)
         .filter_map(|(alias, version)| version.resolved_key(alias))
         .map(|child| (child, Dependent::Importer));
+    // A snapshot records the package it picked for one of its peers as an
+    // ordinary dependency entry, but the snapshot is not that package's
+    // parent.
     let snapshot_edges = snapshots
         .iter()
         .flat_map(|(parent, snapshot)| {
             snapshot_dependencies(snapshot)
+                .filter(|(alias, _)| !is_peer_of(parent, alias))
                 .filter_map(|(alias, dependency)| dependency.resolve(alias))
                 .map(move |child| (child, Dependent::Snapshot(parent)))
-        });
+        })
+        .collect::<Vec<_>>();
     let mut dependents: HashMap<PkgNameVerPeer, Vec<Dependent<'a>>> = HashMap::new();
     for (child, dependent) in importer_edges.chain(snapshot_edges) {
         dependents
@@ -131,7 +138,8 @@ struct ProviderSearch<'a> {
     providers: Vec<SnapshotDepRef>,
     visited: HashSet<&'a PkgNameVerPeer>,
     queue: VecDeque<&'a PkgNameVerPeer>,
-    package_root_link_providers: HashSet<&'a PkgNameVerPeer>,
+    /// `None` stands for the deployed project.
+    package_root_link_providers: HashSet<Option<&'a PkgNameVerPeer>>,
 }
 
 impl<'a> ProviderSearch<'a> {
@@ -139,22 +147,28 @@ impl<'a> ProviderSearch<'a> {
     /// dependents.
     fn visit(&mut self, graph: &DeployedGraph<'a>, dependent: Dependent<'a>, peer: &PkgName) {
         match (provided_peer(graph, dependent, peer), dependent) {
-            (Some(reference), Dependent::Snapshot(provider))
-                if is_package_root_link(&reference) =>
-            {
-                if self.package_root_link_providers.insert(provider) {
-                    self.providers.push(reference);
-                }
-            }
-            (Some(reference), _)
-                if !self.providers.iter().any(|known| same_target(known, &reference, peer)) =>
-            {
-                self.providers.push(reference);
-            }
+            (Some(reference), _) => self.record(reference, dependent, peer),
             (None, Dependent::Snapshot(parent)) if self.visited.insert(parent) => {
                 self.queue.push_back(parent);
             }
-            _ => {}
+            (None, _) => {}
+        }
+    }
+
+    /// Add `reference` unless a provider already names the same package. A
+    /// link into the providing package names a different package for each
+    /// provider.
+    fn record(&mut self, reference: SnapshotDepRef, dependent: Dependent<'a>, peer: &PkgName) {
+        let is_new = if is_package_root_link(&reference) {
+            self.package_root_link_providers.insert(match dependent {
+                Dependent::Importer => None,
+                Dependent::Snapshot(provider) => Some(provider),
+            })
+        } else {
+            !self.providers.iter().any(|known| same_target(known, &reference, peer))
+        };
+        if is_new {
+            self.providers.push(reference);
         }
     }
 }

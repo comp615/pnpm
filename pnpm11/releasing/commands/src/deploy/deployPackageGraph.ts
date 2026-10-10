@@ -121,7 +121,7 @@ export function bindSingletonPeers (
     importer,
     packages,
     references: collectReferencesByName(importer, packages),
-    dependents: collectDependents(importer, packages),
+    dependents: collectDependents(importer, packages, linkedWorkspaceProjects),
   }
   for (const [depPath, linkedProject] of linkedWorkspaceProjects) {
     const snapshot = packages[depPath]
@@ -271,11 +271,23 @@ function describeReference (reference: string, alias: string): string {
   return name === alias ? depPath.slice(alias.length + 1) : depPath
 }
 
-function collectDependents (importer: ProjectSnapshot, packages: PackageSnapshots): Map<DepPath, Dependent[]> {
+/**
+ * A snapshot records the package it picked for one of its peers as an ordinary
+ * dependency entry, but the snapshot is not that package's parent, so such an
+ * entry is left out.
+ */
+function collectDependents (
+  importer: ProjectSnapshot,
+  packages: PackageSnapshots,
+  linkedWorkspaceProjects: Map<DepPath, LinkedWorkspaceProject>
+): Map<DepPath, Dependent[]> {
   const dependents = new Map<DepPath, Dependent[]>()
   addDependents(dependents, IMPORTER, [importer.dependencies, importer.devDependencies, importer.optionalDependencies])
   for (const [depPath, snapshot] of Object.entries(packages) as Array<[DepPath, PackageSnapshot]>) {
-    addDependents(dependents, depPath, [snapshot.dependencies, snapshot.optionalDependencies])
+    const peers = linkedWorkspaceProjects.get(depPath)?.manifest.peerDependencies ?? snapshot.peerDependencies ?? {}
+    const nonPeerDependencies = [snapshot.dependencies, snapshot.optionalDependencies]
+      .map(dependencies => dependencies && Object.fromEntries(Object.entries(dependencies).filter(([alias]) => !Object.hasOwn(peers, alias))))
+    addDependents(dependents, depPath, nonPeerDependencies)
   }
   return dependents
 }

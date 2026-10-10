@@ -776,6 +776,74 @@ fn shared_lockfile_deploy_refuses_a_peer_its_parents_provide_as_different_packag
     drop((root, mock_instance));
 }
 
+/// `consumer` declares `lib` as a peer, which `autoInstallPeers` records as
+/// one of its dependencies. That does not make `consumer` a parent of `lib`, so
+/// its own copy of `lib`'s peer does not compete with `app`'s.
+#[test]
+fn shared_lockfile_deploy_does_not_treat_a_peer_consumer_as_a_parent() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    write_peer_workspace(&workspace);
+    let workspace_yaml = fs::read_to_string(workspace.join("pnpm-workspace.yaml"))
+        .unwrap()
+        .replace("autoInstallPeers: false", "autoInstallPeers: true");
+    fs::write(workspace.join("pnpm-workspace.yaml"), workspace_yaml).unwrap();
+    write_project(
+        &workspace,
+        "consumer",
+        &serde_json::json!({
+            "name": "consumer",
+            "version": "1.0.0",
+            "files": ["index.js"],
+            "peerDependencies": { "lib": "workspace:*" },
+            "dependencies": { "@pnpm.e2e/peer-a": "1.0.1" },
+        }),
+    );
+    write_project(
+        &workspace,
+        "app",
+        &serde_json::json!({
+            "name": "app",
+            "version": "1.0.0",
+            "files": ["index.js"],
+            "dependencies": {
+                "lib": "workspace:*",
+                "consumer": "workspace:*",
+                "@pnpm.e2e/peer-a": "1.0.0",
+            },
+        }),
+    );
+
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+    let workspace_lockfile = Lockfile::load_wanted_from_dir(&workspace).unwrap().unwrap();
+    let lib: PkgName = "lib".parse().unwrap();
+    assert!(
+        workspace_lockfile.importers["packages/consumer"].dependencies
+            .as_ref()
+            .is_some_and(|dependencies| dependencies.contains_key(&lib)),
+        "the source lockfile should record lib as a dependency of consumer",
+    );
+    let deploy_dir = fs::canonicalize(root.path()).unwrap().join("deploy");
+    pacquet_cmd(&workspace)
+        .with_args(["--filter", "app", "deploy", "--prod"])
+        .with_arg(&deploy_dir)
+        .assert()
+        .success();
+
+    assert_eq!(dependency_version(&deploy_dir, "lib", "@pnpm.e2e/peer-a"), "1.0.0");
+
+    drop((root, mock_instance));
+}
+
 /// Without a dev dependency on its peer, `autoInstallPeers` installs it as a
 /// dependency of `lib`, which binds the peer before the deploy has to.
 #[test]
